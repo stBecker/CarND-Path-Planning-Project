@@ -8,6 +8,9 @@
 #include "Eigen-3.3/Eigen/Core"
 #include "Eigen-3.3/Eigen/QR"
 #include "json.hpp"
+#include "spline.h"
+
+#include "pathplanner.h"
 
 using namespace std;
 
@@ -163,6 +166,29 @@ vector<double> getXY(double s, double d, const vector<double> &maps_s, const vec
 
 }
 
+
+tk::spline x_spline;
+tk::spline y_spline;
+tk::spline dx_spline;
+tk::spline dy_spline;
+
+const double TRACK_DISTANCE = 6945.554;
+
+
+vector<double> convert_sd_to_xy(const double s, const double d) {
+  const double mod_s = fmod(s, TRACK_DISTANCE);
+  const double x_edge = x_spline(mod_s);
+  const double y_edge = y_spline(mod_s);
+  const double dx = dx_spline(mod_s);
+  const double dy = dy_spline(mod_s);
+
+  const double x = x_edge + dx * d;
+  const double y = y_edge + dy * d;
+
+  return{ x, y };
+}
+
+
 int main() {
   uWS::Hub h;
 
@@ -174,9 +200,9 @@ int main() {
   vector<double> map_waypoints_dy;
 
   // Waypoint map to read from
-  string map_file_ = "../data/highway_map.csv";
+  const string map_file_ = "../data/highway_map.csv";
   // The max s value before wrapping around the track back to 0
-  double max_s = 6945.554;
+  const double max_s = 6945.554;
 
   ifstream in_map_(map_file_.c_str(), ifstream::in);
 
@@ -200,7 +226,15 @@ int main() {
   	map_waypoints_dy.push_back(d_y);
   }
 
-  h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
+  x_spline.set_points(map_waypoints_s, map_waypoints_x);
+  y_spline.set_points(map_waypoints_s, map_waypoints_y);
+  dx_spline.set_points(map_waypoints_s, map_waypoints_dx);
+  dy_spline.set_points(map_waypoints_s, map_waypoints_dy);
+
+  State initial_state_s(0,0,0);
+  State initial_state_d(0, 0, 0);
+
+  h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy,&initial_state_s,&initial_state_d](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
                      uWS::OpCode opCode) {
     // "42" at the start of the message means there's a websocket message event.
     // The 4 signifies a websocket message
@@ -226,6 +260,18 @@ int main() {
           	double car_d = j[1]["d"];
           	double car_yaw = j[1]["yaw"];
           	double car_speed = j[1]["speed"];
+            // v is in mph, convert to m/s
+            car_speed *= 0.44704;
+
+            const double timestep_in_seconds = 0.02;
+            //double car_speed_per_timestep = car_speed*timestep_in_seconds;
+            const double speed_goal = 40.0 * 0.44704;
+            //const double speed_goal_per_timestep = speed_goal*timestep_in_seconds;
+            const double max_a = 5.0;
+            //double max_acceleration_per_timestep = 5.0*timestep_in_seconds;
+            // 1.5 seconds window
+            const double T = 2.0;
+            const int num_timesteps = T / timestep_in_seconds;
 
           	// Previous path data given to the Planner
           	auto previous_path_x = j[1]["previous_path_x"];
@@ -242,16 +288,87 @@ int main() {
           	vector<double> next_x_vals;
           	vector<double> next_y_vals;
 
+            // add previous values
+            for (size_t i = 0; i < previous_path_x.size(); i++)
+            {
+              next_x_vals.push_back(previous_path_x[i]);
+              next_y_vals.push_back(previous_path_y[i]);
+            }
 
-          	// TODO: define a path made up of (x,y) points that the car will visit sequentially every .02 seconds
-          	msgJson["next_x"] = next_x_vals;
-          	msgJson["next_y"] = next_y_vals;
+            if (previous_path_x.size() < 10)
+            {
+              //get current lane
 
-          	auto msg = "42[\"control\","+ msgJson.dump()+"]";
+              //check sensor data for obstacles
 
-          	//this_thread::sleep_for(chrono::milliseconds(1000));
-          	ws.send(msg.data(), msg.length(), uWS::OpCode::TEXT);
-          
+              //compute cost: stay, turn
+
+              //chose lane with lowest cost
+
+
+              vector<double> trajectory_s;
+              vector<double> trajectory_d;
+
+              const double middle_lane_d = 6.1;
+              const double left_lane_d = 2.4;
+              const double right_lane_d = 9.8;
+
+              double initial_s = end_path_s;
+              double initial_d = end_path_d;
+              if (initial_s < 0.1)
+              {
+                initial_s = car_s;
+                initial_d = car_d;
+                initial_state_s = State(initial_s, car_speed, 0.0);
+                initial_state_d = State(initial_d, 0.0, 0.0);
+              }
+
+              car_speed = initial_state_s.v;
+              if (car_speed<speed_goal)
+              {
+                car_speed += max_a;
+              }
+              State final_state_s = State(initial_state_s.p + car_speed*T, car_speed, 0.0);
+              JMT jmt_s = JMT(initial_state_s, final_state_s, T);
+
+              State final_state_d = State(middle_lane_d, 0.0, 0.0);
+              JMT jmt_d = JMT(initial_state_d, final_state_d, T);
+
+              initial_state_s = final_state_s;
+              initial_state_d = final_state_d;
+
+              for (size_t t = 0; t < num_timesteps; t++)
+              {
+                double s_t = jmt_s.Evaluate(t*timestep_in_seconds);
+                double d_t = jmt_d.Evaluate(t*timestep_in_seconds);
+                trajectory_s.push_back(s_t);
+                trajectory_d.push_back(d_t);
+              }
+
+              // convert trajectory to map coords
+              for (size_t i = 0; i < trajectory_s.size(); i++)
+              {
+                double s = trajectory_s[i];
+                double d = trajectory_d[i];
+
+                //vector<double> xy = getXY(s, d, map_waypoints_s, map_waypoints_x, map_waypoints_y);
+
+                vector<double> xy = convert_sd_to_xy(s, d);
+
+                next_x_vals.push_back(xy[0]);
+                next_y_vals.push_back(xy[1]);
+              }
+            }
+
+            msgJson["next_x"] = next_x_vals;
+            msgJson["next_y"] = next_y_vals;
+            auto msg = "42[\"control\"," + msgJson.dump() + "]";
+
+            //this_thread::sleep_for(chrono::milliseconds(1000));
+            ws.send(msg.data(), msg.length(), uWS::OpCode::TEXT);
+            cout << msg << endl;
+            //cout << j[1] << endl;
+
         }
       } else {
         // Manual driving
